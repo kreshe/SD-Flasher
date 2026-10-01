@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="SD FLASHER"
+VERSION="1.5"
+
+# Домашний каталог пользователя, который реально запустил скрипт.
+ORIGINAL_USER="${SUDO_USER:-${USER:-root}}"
+ORIGINAL_HOME="$(getent passwd "$ORIGINAL_USER" 2>/dev/null | awk -F: 'NR==1 {print $6}')"
+[[ -n "$ORIGINAL_HOME" ]] || ORIGINAL_HOME="${HOME:-/root}"
+CONFIG_FILE="${ORIGINAL_HOME}/.sd_flasher.conf"
+LOG_DIR="${ORIGINAL_HOME}/.sd_flasher_logs"
+RUN_DIR="${LOG_DIR}/.run_$$"
+BS="16M"
+
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+BLUE='\033[1;34m'
+WHITE='\033[1;37m'
+GRAY='\033[0;90m'
+NC='\033[0m'
+
+msg()  { printf '%b\n' "$*"; }
+ok()   { msg "${GREEN}✓${NC} $*"; }
+warn() { msg "${YELLOW}⚠${NC} $*"; }
+err()  { msg "${RED}✗${NC} $*" >&2; }
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM
+    if [[ -d "$RUN_DIR" ]]; then
+        rm -rf -- "$RUN_DIR" 2>/dev/null || true
+    fi
+    if (( rc != 0 )); then
+        printf '\n%b\n' "${RED}Скрипт завершён с ошибкой (код ${rc}).${NC}" >&2
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+
+on_int() {
+    printf '\n'
+    warn "Ctrl+C: останавливаю активные записи..."
+    for pid in "${PIDS[@]:-}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 1
+    for pid in "${PIDS[@]:-}"; do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+    exit 130
+}
+trap on_int INT TERM
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        err "Не найдена команда: $1"
+        exit 1
+    }
+}
+
+# -----------------------------------------------------------------------------
+# ROOT
+# -----------------------------------------------------------------------------
+if [[ ${EUID} -ne 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        err "Для записи на SD-карты нужен root. Установите sudo или запустите скрипт от root."
+        exit 1
+    fi
+    exec sudo -E bash "$0" "$@"
+fi
+
+for c in bash lsblk findmnt umount dd sync awk sed grep tr stat readlink dirname basename head find sort date numfmt udevadm getent; do
+    require_cmd "$c"
+done
+
+mkdir -p "$LOG_DIR"
+mkdir -p "$RUN_DIR"
+
+# -----------------------------------------------------------------------------
+# Сохранённый образ
+# -----------------------------------------------------------------------------
+LAST_IMAGE=""
+if [[ -f "$CONFIG_FILE" ]]; then
+    LAST_IMAGE="$(sed -n '1p' "$CONFIG_FILE" 2>/dev/null || true)"
+fi
+
+save_last_image() {
+    local image_path="$1"
+    local config_dir group_name
+    config_dir="$(dirname -- "$CONFIG_FILE")"
+    mkdir -p "$config_dir"
+    printf '%s\n' "$image_path" > "$CONFIG_FILE"
+    if [[ "$ORIGINAL_USER" != "root" && -n "$ORIGINAL_USER" ]]; then
+        group_name="$(id -gn "$ORIGINAL_USER" 2>/dev/null || printf '%s' "$ORIGINAL_USER")"
+        chown "$ORIGINAL_USER:$group_name" "$CONFIG_FILE" "$LOG_DIR" 2>/dev/null || true
+    fi
+}
+
+clear || true
+msg "${CYAN}╔═════════════════════════════════════════════════════════╗${NC}"
+msg "${CYAN}║${NC}                      ${WHITE}${APP_NAME}${NC}  ${GRAY}v${VERSION}${NC}                   ${CYAN}║${NC}"
+msg "${CYAN}║${NC}       Параллельная запись образа на SD/USB флешки       ${CYAN}║${NC}"
+msg "${CYAN}╚═════════════════════════════════════════════════════════╝${NC}"
+printf '\n'
+
+# -----------------------------------------------------------------------------
+# Выбор образа
+# -----------------------------------------------------------------------------
+mapfile -d '' IMAGE_LIST < <(
+    {
+        [[ -d "$PWD" ]] && find "$PWD" -maxdepth 1 -type f \( -iname '*.img' -o -iname '*.img.xz' -o -iname '*.img.gz' -o -iname '*.img.zst' -o -iname '*.xz' -o -iname '*.gz' -o -iname '*.zst' \) -print0
+        [[ -d "$ORIGINAL_HOME/Downloads" ]] && find "$ORIGINAL_HOME/Downloads" -maxdepth 2 -type f \( -iname '*.img' -o -iname '*.img.xz' -o -iname '*.img.gz' -o -iname '*.img.zst' -o -iname '*.xz' -o -iname '*.gz' -o -iname '*.zst' \) -print0
+    } | sort -zu
+)
+
+choose_image() {
+    local i=1 choice path manual_index=0
+
+    if [[ -n "$LAST_IMAGE" && -f "$LAST_IMAGE" ]]; then
+        msg "${WHITE}Последний использованный образ:${NC}"
+        printf '  1) %s\n' "$LAST_IMAGE"
+        printf '  2) Выбрать другой образ\n\n'
+        while true; do
+            read -r -p "Номер [1-2, ENTER=1]: " choice
+            choice="${choice:-1}"
+            if [[ "$choice" == "1" ]]; then
+                IMAGE="$(readlink -f -- "$LAST_IMAGE")"
+                return 0
+            elif [[ "$choice" == "2" ]]; then
+                break
+            fi
+            warn "Введите 1 или 2."
+        done
+    elif [[ -n "$LAST_IMAGE" ]]; then
+        warn "Последний сохранённый образ больше не найден: $LAST_IMAGE"
+        printf '\n'
+    fi
+
+    if ((${#IMAGE_LIST[@]})); then
+        msg "${WHITE}Выберите образ:${NC}"
+        for path in "${IMAGE_LIST[@]}"; do
+            printf '  %2d) %s\n' "$i" "$path"
+            ((i++))
+        done
+        printf '  %2d) Ввести путь вручную\n' "$i"
+        manual_index=$i
+        printf '\n'
+        while true; do
+            read -r -p "Номер [1-${manual_index}]: " choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= manual_index )); then
+                if (( choice == manual_index )); then
+                    break
+                fi
+                IMAGE="$(readlink -f -- "${IMAGE_LIST[$((choice-1))]}")"
+                return 0
+            fi
+            warn "Введите номер из списка."
+        done
+    fi
+
+    while true; do
+        read -e -r -p "Путь к образу: " path
+        path="${path/#\~/$ORIGINAL_HOME}"
+        if [[ -f "$path" ]]; then
+            IMAGE="$(readlink -f -- "$path")"
+            return 0
+        fi
+        warn "Файл не найден."
+    done
+}
+
+choose_image
+save_last_image "$IMAGE"
+
+case "${IMAGE,,}" in
+    *.img|*.img.xz|*.img.gz|*.img.zst|*.xz|*.gz|*.zst) ;;
+    *) err "Неподдерживаемый формат. Используйте .img, .img.xz, .img.gz или .img.zst."; exit 1 ;;
+esac
+
+IMAGE_SIZE=0
+case "${IMAGE,,}" in
+    *.xz|*.img.xz|*.gz|*.img.gz|*.zst|*.img.zst) ;;
+    *) IMAGE_SIZE=$(stat -c '%s' -- "$IMAGE") ;;
+esac
+
+printf '\n'
+ok "Образ: ${WHITE}${IMAGE}${NC}"
+if (( IMAGE_SIZE > 0 )); then
+    printf '   Размер: %s\n' "$(numfmt --to=iec --suffix=B "$IMAGE_SIZE" 2>/dev/null || echo "$IMAGE_SIZE bytes")"
+else
+    printf '   Размер: сжатый образ\n'
+fi
+
+# -----------------------------------------------------------------------------
+# Системный диск
+# -----------------------------------------------------------------------------
+ROOT_SOURCE="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+ROOT_DISK=""
+if [[ -n "$ROOT_SOURCE" ]]; then
+    PKNAME=$(lsblk -no PKNAME "$ROOT_SOURCE" 2>/dev/null | head -n1 || true)
+    if [[ -n "$PKNAME" ]]; then
+        ROOT_DISK="/dev/$PKNAME"
+    else
+        while IFS= read -r n; do
+            [[ -n "$n" ]] || continue
+            case "$n" in
+                /dev/nvme*n*|/dev/mmcblk[0-9]*|/dev/sd[a-z]*|/dev/vd[a-z]*|/dev/xvd[a-z]*|/dev/hd[a-z]*) ROOT_DISK="$n"; break ;;
+            esac
+        done < <(lsblk -sno NAME "$ROOT_SOURCE" 2>/dev/null | sed 's#^#/dev/#')
+    fi
+fi
+
+disk_is_mounted() {
+    local disk="$1"
+    lsblk -nrpo NAME,MOUNTPOINTS -- "$disk" 2>/dev/null | awk '$2 ~ /^\// {found=1} END {exit !found}'
+}
+
+discover_disks() {
+    DEV_NAMES=(); DEV_SIZES=(); DEV_MODELS=(); DEV_TRANS=(); DEV_SERIALS=(); DEV_RM=(); DEV_MOUNTED=()
+    mapfile -t DISKS < <(lsblk -dnpo NAME,TYPE 2>/dev/null | awk '$2=="disk" {print $1}')
+
+    for name in "${DISKS[@]}"; do
+        [[ -n "$name" ]] || continue
+        size=$(lsblk -dnpo SIZE -- "$name" 2>/dev/null || true)
+        model=$(lsblk -dnpo MODEL -- "$name" 2>/dev/null || true)
+        trans=$(lsblk -dnpo TRAN -- "$name" 2>/dev/null || true)
+        rm=$(lsblk -dnpo RM -- "$name" 2>/dev/null || true)
+        [[ -n "$rm" ]] || rm=0
+
+        udev_props=$(udevadm info --query=property --name="$name" 2>/dev/null || true)
+        id_bus=$(printf '%s\n' "$udev_props" | awk -F= '$1=="ID_BUS" {print $2; exit}')
+        id_model=$(printf '%s\n' "$udev_props" | awk -F= '$1=="ID_MODEL_FROM_DATABASE" {print $2; exit}')
+        [[ -n "$id_model" ]] || id_model=$(printf '%s\n' "$udev_props" | awk -F= '$1=="ID_MODEL" {print $2; exit}')
+        id_vendor=$(printf '%s\n' "$udev_props" | awk -F= '$1=="ID_VENDOR_FROM_DATABASE" {print $2; exit}')
+        [[ -n "$id_vendor" ]] || id_vendor=$(printf '%s\n' "$udev_props" | awk -F= '$1=="ID_VENDOR" {print $2; exit}')
+
+        external=0
+        if [[ "$rm" == "1" || "$trans" == "usb" || "$trans" == "mmc" || "$id_bus" == "usb" ]]; then external=1; fi
+        if [[ "$model" == *TS-RDF5A* || "$id_model" == *TS-RDF5A* || "$id_vendor" == *Transcend* || "$model" == *Transcend* ]]; then external=1; fi
+        (( external == 1 )) || continue
+        [[ -n "$ROOT_DISK" && "$name" == "$ROOT_DISK" ]] && continue
+
+        mounted=0
+        disk_is_mounted "$name" && mounted=1 || true
+        serial=$(lsblk -dnpo SERIAL -- "$name" 2>/dev/null || true)
+
+        DEV_NAMES+=("$name")
+        DEV_SIZES+=("$size")
+        display_model="${model:-${id_model:-Unknown}}"
+        if [[ "$display_model" == *TS-RDF5A* || "$id_model" == *TS-RDF5A* || "$id_vendor" == *Transcend* || "$model" == *Transcend* ]]; then
+            display_model="${display_model} [кардридер Transcend]"
+        fi
+        DEV_MODELS+=("$display_model")
+        DEV_TRANS+=("${trans:-${id_bus:-?}}")
+        DEV_SERIALS+=("${serial:-—}")
+        DEV_RM+=("$rm")
+        DEV_MOUNTED+=("$mounted")
+    done
+}
+
+while true; do
+    discover_disks
+    if ((${#DEV_NAMES[@]} > 0)); then break; fi
+    printf '\n'
+    warn "Внешние/съёмные SD/USB-накопители не обнаружены."
+    [[ -n "$ROOT_DISK" ]] && printf '   Системный диск защищён от записи: %s\n' "$ROOT_DISK"
+    printf '   Подключите SD/USB. После подключения нажмите ENTER для повторного сканирования.\n'
+    read -r -p "ENTER — сканировать снова, Q — выйти: " retry
+    [[ "$retry" =~ ^[Qq]$ ]] && exit 0
+done
+
+printf '\n'
+msg "${WHITE}Доступные накопители:${NC}\n"
+printf '  %-4s %-12s %-9s %-10s %-28s %-16s %s\n' '№' 'УСТРОЙСТВО' 'РАЗМЕР' 'ТРАНСПОРТ' 'МОДЕЛЬ' 'СОСТОЯНИЕ' 'SERIAL'
+printf '  %-4s %-12s %-9s %-10s %-28s %-16s %s\n' '---' '------------' '---------' '----------' '----------------------------' '----------------' '------------'
+for ((i=0; i<${#DEV_NAMES[@]}; i++)); do
+    if [[ "${DEV_MOUNTED[$i]}" == "1" ]]; then mount_state="${YELLOW}СМОНТИРОВАН${NC}"; else mount_state="${GREEN}ГОТОВ${NC}"; fi
+    printf '  %-4s %-12s %-9s %-10s %-28.28s %-24b %s\n' \
+        "$((i+1))" "${DEV_NAMES[$i]}" "${DEV_SIZES[$i]}" "${DEV_TRANS[$i]}" "${DEV_MODELS[$i]}" "$mount_state" "${DEV_SERIALS[$i]}"
+done
+printf '\n'
+msg "${GRAY}Можно выбирать уже записанные и смонтированные карты — перед прошивкой они будут размонтированы.${NC}"
+msg "${GRAY}Несколько устройств: 1 3 4. Все устройства: all${NC}"
+
+TARGETS=()
+while true; do
+    read -r -p "Номера флешек: " selection
+    selection="$(tr ',' ' ' <<< "$selection")"
+    TARGETS=(); valid=1
+    if [[ "$selection" == "all" || "$selection" == "ALL" ]]; then TARGETS=("${DEV_NAMES[@]}"); break; fi
+    [[ -n "$selection" ]] || { warn "Нужно выбрать хотя бы одну флешку."; continue; }
+    for token in $selection; do
+        if ! [[ "$token" =~ ^[0-9]+$ ]] || (( token < 1 || token > ${#DEV_NAMES[@]} )); then valid=0; break; fi
+        dev="${DEV_NAMES[$((token-1))]}"; duplicate=0
+        for selected in "${TARGETS[@]}"; do [[ "$selected" == "$dev" ]] && duplicate=1 && break; done
+        (( duplicate == 0 )) && TARGETS+=("$dev")
+    done
+    if (( valid && ${#TARGETS[@]} > 0 )); then break; fi
+    warn "Некорректный выбор. Используйте номера из списка."
+done
+
+printf '\n'
+msg "${YELLOW}════════════════ ПРОВЕРКА ПЕРЕД ЗАПИСЬЮ ════════════════${NC}"
+printf '%b\n' "${WHITE}Образ:${NC} $IMAGE"
+printf '%b\n' "${WHITE}Назначения:${NC}"
+for dev in "${TARGETS[@]}"; do
+    idx=-1
+    for ((i=0; i<${#DEV_NAMES[@]}; i++)); do [[ "${DEV_NAMES[$i]}" == "$dev" ]] && idx=$i && break; done
+    printf '   %b %s  %s  %s\n' "${CYAN}→${NC}" "$dev" "${DEV_SIZES[$idx]}" "${DEV_MODELS[$idx]}"
+done
+
+if [[ -n "$ROOT_DISK" ]]; then
+    for dev in "${TARGETS[@]}"; do
+        [[ "$dev" == "$ROOT_DISK" ]] && { err "КРИТИЧЕСКАЯ ОШИБКА: выбран системный диск $dev. Запись отменена."; exit 1; }
+    done
+fi
+
+printf '\n'
+read -r -p "Начать запись? Введите y: " confirm
+[[ "$confirm" == "y" ]] || { warn "Запись отменена."; exit 0; }
+
+unmount_children() {
+    local disk="$1" node mp
+    while IFS= read -r node; do
+        [[ -n "$node" ]] || continue
+        while IFS= read -r mp; do
+            [[ -n "$mp" ]] || continue
+            msg "  Размонтирование: $node ($mp)"
+            umount -- "$mp" 2>/dev/null || umount -- "$node" || true
+        done < <(findmnt -rn -S "$node" -o TARGET 2>/dev/null || true)
+    done < <(lsblk -lnpo NAME,TYPE -- "$disk" 2>/dev/null | awk '$1 != "" && $2 != "disk" {print $1}')
+}
+
+printf '\n'
+msg "${CYAN}Подготовка устройств...${NC}"
+for dev in "${TARGETS[@]}"; do
+    unmount_children "$dev"
+    if disk_is_mounted "$dev"; then err "Не удалось размонтировать $dev. Запись отменена."; exit 1; fi
+    ok "$dev готов"
+done
+command -v udevadm >/dev/null 2>&1 && udevadm settle || true
+
+case "${IMAGE,,}" in
+    *.xz|*.img.xz) require_cmd xz ;;
+    *.gz|*.img.gz) require_cmd gzip ;;
+    *.zst|*.img.zst) require_cmd zstd ;;
+esac
+
+# -----------------------------------------------------------------------------
+# Служебные функции статуса
+# -----------------------------------------------------------------------------
+set_state() { printf '%s\n' "$2" > "$RUN_DIR/$1.state"; }
+set_progress() { printf '%s\n' "$2" > "$RUN_DIR/$1.progress"; }
+
+flash_one() {
+    local dev="$1" log="$2" id="$3" start_ts
+    start_ts=$(date +%s)
+    set_state "$id" "ПОДГОТОВКА"
+    set_progress "$id" "0"
+    {
+        printf 'DEVICE=%s\nIMAGE=%s\nSTART=%s\n\n' "$dev" "$IMAGE" "$(date '+%Y-%m-%d %H:%M:%S')"
+        set_state "$id" "ЗАПИСЬ"
+        case "${IMAGE,,}" in
+            *.img)
+                dd if="$IMAGE" of="$dev" bs="$BS" iflag=fullblock status=progress conv=fsync
+                ;;
+            *.img.xz|*.xz)
+                xz -dc -- "$IMAGE" | dd of="$dev" bs="$BS" iflag=fullblock status=progress conv=fsync
+                ;;
+            *.img.gz|*.gz)
+                gzip -dc -- "$IMAGE" | dd of="$dev" bs="$BS" iflag=fullblock status=progress conv=fsync
+                ;;
+            *.img.zst|*.zst)
+                zstd -dc -- "$IMAGE" | dd of="$dev" bs="$BS" iflag=fullblock status=progress conv=fsync
+                ;;
+            *) return 2 ;;
+        esac
+        set_state "$id" "СИНХРОНИЗАЦИЯ"
+        sync
+        command -v blockdev >/dev/null 2>&1 && blockdev --rereadpt "$dev" >/dev/null 2>&1 || true
+        command -v udevadm >/dev/null 2>&1 && udevadm settle || true
+        set_progress "$id" "100"
+        set_state "$id" "ГОТОВО"
+        printf '\nГОТОВО\nEND=%s\nELAPSED=%ss\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(( $(date +%s) - start_ts ))"
+    } >"$log" 2>&1
+}
+
+# -----------------------------------------------------------------------------
+# Параллельный запуск
+# -----------------------------------------------------------------------------
+PIDS=(); LOGS=(); IDS=(); STATUS=(); START_TIMES=()
+printf '\n'
+msg "${CYAN}Запускаю параллельную запись на ${#TARGETS[@]} устройств...${NC}"
+
+for dev in "${TARGETS[@]}"; do
+    safe_name="$(basename "$dev" | tr '/ ' '__')"
+    id="${safe_name}_$RANDOM"
+    log="$LOG_DIR/${safe_name}_$(date +%Y%m%d_%H%M%S)_$$.log"
+    touch "$RUN_DIR/$id.state" "$RUN_DIR/$id.progress"
+    flash_one "$dev" "$log" "$id" &
+    pid=$!
+    PIDS+=("$pid"); LOGS+=("$log"); IDS+=("$id"); STATUS+=("RUN"); START_TIMES+=("$(date +%s)")
+    printf '  %b %-12s PID=%-7s\n' "${GREEN}▶${NC}" "$dev" "$pid"
+    printf '      %b\n' "${GRAY}Лог: $log${NC}"
+done
+
+# -----------------------------------------------------------------------------
+# Живой мониторинг
+# -----------------------------------------------------------------------------
+spinner=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' )
+spin=0
+remaining=${#TARGETS[@]}
+
+while (( remaining > 0 )); do
+    sleep 1
+    remaining=0
+
+    for ((i=0; i<${#TARGETS[@]}; i++)); do
+        [[ "${STATUS[$i]}" == "RUN" ]] || continue
+        if kill -0 "${PIDS[$i]}" 2>/dev/null; then
+            ((++remaining))
+        else
+            if wait "${PIDS[$i]}"; then STATUS[$i]="OK"; else STATUS[$i]="FAIL"; fi
+        fi
+    done
+
+    spin=$(( (spin + 1) % ${#spinner[@]} ))
+
+    # Перерисовываем только наш экран статуса. Пользователь постоянно видит,
+    # что процессы живы, а не просто одну строку "ЗАПИСЬ".
+    printf '\033[H\033[J'
+    msg "${CYAN}╔════════════════════════════════════════════════════════════════════╗${NC}"
+    msg "${CYAN}║${NC} ${WHITE}${APP_NAME}${NC} — запись выполняется ${spinner[$spin]}                    ${CYAN}║${NC}"
+    msg "${CYAN}╚════════════════════════════════════════════════════════════════════╝${NC}"
+    printf '\n'
+    printf '%b\n' "${WHITE}Образ:${NC} $IMAGE"
+    printf '\n'
+
+    for ((i=0; i<${#TARGETS[@]}; i++)); do
+        dev="${TARGETS[$i]}"; id="${IDS[$i]}"; log="${LOGS[$i]}"
+        state="$(cat "$RUN_DIR/$id.state" 2>/dev/null || echo 'ЗАПУСК')"
+        progress_line="$(tr '\r' '\n' < "$log" 2>/dev/null | grep -E '[0-9]+ bytes' | tail -n1 || true)"
+        elapsed=$(( $(date +%s) - START_TIMES[$i] ))
+        mins=$((elapsed/60)); secs=$((elapsed%60))
+
+        if [[ "${STATUS[$i]}" == "FAIL" ]]; then
+            state="ОШИБКА"
+        fi
+
+        case "$state" in
+            ГОТОВО) color="$GREEN"; symbol="✓" ;;
+            СИНХРОНИЗАЦИЯ) color="$CYAN"; symbol="↻" ;;
+            ОШИБКА) color="$RED"; symbol="✗" ;;
+            *) color="$YELLOW"; symbol="${spinner[$spin]}" ;;
+        esac
+
+        printf '%b\n' "${color}${symbol}${NC} ${WHITE}${dev}${NC}   [${color}${state}${NC}]   время: $(printf '%02d:%02d' "$mins" "$secs")"
+
+        if [[ -n "$progress_line" ]]; then
+            # GNU dd пишет, например:
+            # 123456 bytes (123 kB, 120 KiB) copied, 1.2 s, 100 MB/s
+            bytes="$(sed -n 's/^\([0-9][0-9]*\) bytes.*/\1/p' <<< "$progress_line" | tail -n1)"
+            speed="$(sed -n 's/.*copied, [^,]*, \(.*\)$/\1/p' <<< "$progress_line" | tail -n1)"
+            if [[ -n "$bytes" ]]; then
+                written_h="$(numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || echo "$bytes B")"
+                if (( IMAGE_SIZE > 0 )); then
+                    pct=$(( bytes * 100 / IMAGE_SIZE ))
+                    (( pct > 100 )) && pct=100
+                    bar_len=36
+                    filled=$(( pct * bar_len / 100 ))
+                    empty=$(( bar_len - filled ))
+                    bar="$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' "$empty" '' | tr ' ' '-')"
+                    printf '    [%s] %3d%%  %s' "$bar" "$pct" "$written_h"
+                else
+                    printf '    Записано: %s' "$written_h"
+                fi
+                [[ -n "$speed" ]] && printf '  |  %s' "$speed"
+                printf '\n'
+            else
+                printf '    %s\n' "$progress_line"
+            fi
+        else
+            if [[ "${STATUS[$i]}" == "FAIL" ]]; then
+                printf '    %bОшибка записи. Последние сообщения:%b\n' "$RED" "$NC"
+            else
+                case "$state" in
+                    ПОДГОТОВКА) printf '    Подготовка устройства...\n' ;;
+                    ЗАПИСЬ) printf '    Запись идёт... передача данных активна.\n' ;;
+                    СИНХРОНИЗАЦИЯ) printf '    Данные записаны, выполняется sync...\n' ;;
+                    ГОТОВО) printf '    Запись завершена.\n' ;;
+                    *) printf '    Операция запущена, ожидаю данные от dd...\n' ;;
+                esac
+            fi
+        fi
+
+        # ---------------------------------------------------------------------
+        # Живой лог прямо под статусом устройства. dd использует CR вместо
+        # обычного переноса строки, поэтому преобразуем CR -> NL и показываем
+        # только несколько последних строк. Это позволяет видеть реальные
+        # сообщения записи, ошибки и текущий вывод dd без открытия отдельного
+        # файла лога.
+        # ---------------------------------------------------------------------
+        printf '    %b┌─ LIVE LOG ───────────────────────────────────────────────────────%b\n' "$GRAY" "$NC"
+        live_lines="$(tail -c 8192 -- "$log" 2>/dev/null | tr '\r' '\n' | sed -e 's/[[:cntrl:]]//g' -e '/^[[:space:]]*$/d' | tail -n 6 || true)"
+        if [[ -n "$live_lines" ]]; then
+            while IFS= read -r live_line; do
+                [[ -n "$live_line" ]] || continue
+                # Не дублируем служебную строку DEVICE/IMAGE, а показываем
+                # именно текущий вывод записи.
+                case "$live_line" in
+                    DEVICE=*|IMAGE=*|START=*) continue ;;
+                esac
+                printf '    %b│%b %s\n' "$GRAY" "$NC" "$live_line"
+            done <<< "$live_lines"
+        else
+            printf '    %b│ ожидание вывода...%b\n' "$GRAY" "$NC"
+        fi
+        printf '    %b└────────────────────────────────────────────────────────────────%b\n' "$GRAY" "$NC"
+        printf '    %bФайл лога: %s%b\n\n' "$GRAY" "$log" "$NC"
+    done
+
+done
+
+printf '\n'
+msg "${CYAN}════════════════════ РЕЗУЛЬТАТ ══════════════════════════${NC}"
+fail_count=0
+for ((i=0; i<${#TARGETS[@]}; i++)); do
+    if [[ "${STATUS[$i]}" == "OK" ]]; then
+        ok "${TARGETS[$i]} — запись завершена"
+    else
+        err "${TARGETS[$i]} — ошибка записи"
+        printf '    Лог: %s\n' "${LOGS[$i]}"
+        fail_count=$((fail_count + 1))
+    fi
+done
+
+printf '\n'
+if (( fail_count == 0 )); then
+    msg "${GREEN}Все ${#TARGETS[@]} накопителя успешно записаны.${NC}"
+    msg "${GRAY}Логи: ${LOG_DIR}${NC}"
+    msg "${GRAY}Безопасно извлеките карты/флешки перед отключением.${NC}"
+    exit 0
+else
+    err "Операция завершена с ошибками: $fail_count из ${#TARGETS[@]}."
+    printf '%b\n' "${GRAY}Логи: ${LOG_DIR}${NC}"
+    exit 1
+fi

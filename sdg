@@ -1,0 +1,1420 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    echo "Ошибка: графическая сессия не обнаружена." >&2
+    echo "Запустите скрипт из Ubuntu с рабочим столом." >&2
+    exit 1
+fi
+
+if ! command -v sudo >/dev/null 2>&1; then
+    echo "Ошибка: sudo не найден." >&2
+    exit 1
+fi
+
+if ! sudo -v; then
+    echo "Не удалось получить права sudo." >&2
+    exit 1
+fi
+
+if ! python3 - <<'PY_TK_CHECK' >/dev/null 2>&1
+import tkinter
+PY_TK_CHECK
+then
+    echo "В системе не установлен python3-tk."
+    read -r -p "Установить python3-tk через apt? [Y/n]: " answer
+    answer="${answer:-Y}"
+    if [[ "$answer" =~ ^[YyДд]$ ]]; then
+        sudo apt-get install -y python3-tk
+    else
+        echo "Для GUI нужен python3-tk." >&2
+        exit 1
+    fi
+fi
+
+exec python3 - "$@" <<'PY_GUI'
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import threading
+import time
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+APP_NAME = "SD  FLASHER"
+VERSION = "2.0 GUI"
+BS = "16M"
+HOME = Path.home()
+CONFIG_FILE = HOME / ".sd_flasher.conf"
+LOG_DIR = HOME / ".sd_flasher_logs"
+
+# ──────────────────────────────────────────────────────────────────────
+# Palette
+# ──────────────────────────────────────────────────────────────────────
+BG = "#0b1220"
+BG_TOP = "#0f172a"
+CARD = "#111c2e"
+CARD_2 = "#162338"
+CARD_3 = "#1a2940"
+BORDER = "#24364f"
+TEXT = "#f8fafc"
+TEXT_2 = "#cbd5e1"
+MUTED = "#7f8ea3"
+ACCENT = "#22d3ee"
+ACCENT_2 = "#60a5fa"
+GREEN = "#34d399"
+YELLOW = "#fbbf24"
+RED = "#fb7185"
+ORANGE = "#fb923c"
+LOG_BG = "#07101c"
+LOG_TEXT = "#9fe8bd"
+
+FONT = "DejaVu Sans"
+MONO = "DejaVu Sans Mono"
+
+IMAGE_EXTENSIONS = (".img", ".img.xz", ".img.gz", ".img.zst", ".xz", ".gz", ".zst")
+SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+def run_cmd(args, timeout=20, input_text=None):
+    try:
+        p = subprocess.run(
+            args,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def human_bytes(value):
+    try:
+        value = float(value)
+    except Exception:
+        return "—"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    i = 0
+    while abs(value) >= 1024 and i < len(units) - 1:
+        value /= 1024.0
+        i += 1
+    if i == 0:
+        return f"{int(value)} {units[i]}"
+    return f"{value:.1f} {units[i]}"
+
+
+def parse_bytes(text):
+    m = re.search(r"(?<!\d)(\d+) bytes?", text)
+    return int(m.group(1)) if m else None
+
+
+def load_last_image():
+    try:
+        value = CONFIG_FILE.read_text(encoding="utf-8").splitlines()[0].strip()
+        return Path(value).expanduser()
+    except Exception:
+        return None
+
+
+def save_last_image(path):
+    try:
+        CONFIG_FILE.write_text(str(path) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def root_disk():
+    _, out, _ = run_cmd(["findmnt", "-n", "-o", "SOURCE", "/"])
+    src = out.strip()
+    if not src:
+        return ""
+    _, out, _ = run_cmd(["lsblk", "-no", "PKNAME", src])
+    rows = [x.strip() for x in out.splitlines() if x.strip()]
+    if rows:
+        return "/dev/" + rows[0]
+    _, out, _ = run_cmd(["lsblk", "-sno", "NAME", src])
+    for line in out.splitlines():
+        name = line.strip()
+        if re.fullmatch(r"(?:sd[a-z]+|nvme\d+n\d+|mmcblk\d+|vd[a-z]+|xvd[a-z]+|hd[a-z]+)", name):
+            return "/dev/" + name
+    return ""
+
+
+def get_disks():
+    system = root_disk()
+    code, out, err = run_cmd([
+        "lsblk", "-J", "-o",
+        "NAME,KNAME,PATH,TYPE,SIZE,RM,RO,TRAN,MODEL,SERIAL,MOUNTPOINTS"
+    ])
+    if code != 0:
+        raise RuntimeError(err.strip() or "Не удалось получить список накопителей")
+    data = json.loads(out)
+    result = []
+
+    for d in data.get("blockdevices", []):
+        if d.get("type") != "disk":
+            continue
+        path = d.get("path") or ("/dev/" + str(d.get("kname", "")))
+        if not path or path == system:
+            continue
+
+        rm = str(d.get("rm", "0")) == "1"
+        ro = str(d.get("ro", "0")) == "1"
+        tran = (d.get("tran") or "").lower()
+        model = " ".join((d.get("model") or "").split())
+        serial = " ".join((d.get("serial") or "").split())
+        mounts = [m for m in (d.get("mountpoints") or []) if m]
+
+        _, props, _ = run_cmd(["udevadm", "info", "--query=property", "--name", path])
+        udev = {}
+        for line in props.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                udev[k] = v
+
+        id_bus = (udev.get("ID_BUS") or "").lower()
+        id_model = udev.get("ID_MODEL_FROM_DATABASE") or udev.get("ID_MODEL") or ""
+        id_vendor = udev.get("ID_VENDOR_FROM_DATABASE") or udev.get("ID_VENDOR") or ""
+        all_names = (model + " " + id_model + " " + id_vendor).lower()
+        is_transcend = "transcend" in all_names or "ts-rdf5a" in all_names
+        external = rm or tran in {"usb", "mmc", "sd"} or id_bus == "usb" or is_transcend
+        if not external:
+            continue
+
+        if ro:
+            state = "ТОЛЬКО ЧТЕНИЕ"
+        elif mounts:
+            state = "СМОНТИРОВАН"
+        else:
+            state = "ГОТОВ"
+
+        display_model = model or id_model or id_vendor or "Неизвестное устройство"
+        if is_transcend:
+            display_model = f"{display_model} · кардридер"
+
+        result.append({
+            "path": path,
+            "size": d.get("size") or "—",
+            "rm": rm,
+            "ro": ro,
+            "tran": tran or id_bus or "?",
+            "model": display_model,
+            "serial": serial or "—",
+            "mounts": mounts,
+            "state": state,
+            "system": system,
+            "card_reader": is_transcend,
+        })
+
+    result.sort(key=lambda x: x["path"])
+    return result
+
+
+def partitions_of(disk):
+    _, out, _ = run_cmd(["lsblk", "-lnpo", "NAME,TYPE", "--", disk])
+    parts = []
+    for line in out.splitlines():
+        cols = line.split(None, 1)
+        if len(cols) == 2 and cols[0] and cols[1] != "disk":
+            parts.append(cols[0])
+    return parts
+
+
+def mounted_targets(node):
+    _, out, _ = run_cmd(["findmnt", "-rn", "-S", node, "-o", "TARGET"])
+    return [x.strip() for x in out.splitlines() if x.strip()]
+
+
+def unmount_disk(disk):
+    messages = []
+    for node in partitions_of(disk):
+        targets = mounted_targets(node)
+        for target in targets:
+            p = subprocess.run(
+                ["sudo", "umount", "--", target],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if p.returncode != 0:
+                p2 = subprocess.run(
+                    ["sudo", "umount", "--", node],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                if p2.returncode != 0:
+                    raise RuntimeError(p2.stderr.strip() or f"Не удалось размонтировать {node}")
+            messages.append(f"Размонтировано: {node}")
+    return messages
+
+
+class FlashJob:
+    def __init__(self, app, device, image, log_path, image_size):
+        self.app = app
+        self.device = device
+        self.image = image
+        self.log_path = log_path
+        self.image_size = image_size
+        self.process = None
+        self.thread = None
+        self.status = "ПОДГОТОВКА"
+        self.written = 0
+        self.speed = "—"
+        self.percent = None
+        self.start = time.monotonic()
+        self.elapsed = 0
+        self.log_lines = []
+        self._stop = False
+        self.final_rc = None
+        self.widgets = None
+
+    def start_job(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _build_command(self):
+        low = self.image.name.lower()
+        if low.endswith(".img"):
+            return [
+                "sudo", "dd", f"if={self.image}", f"of={self.device}",
+                f"bs={BS}", "iflag=fullblock", "status=progress", "conv=fsync"
+            ]
+        if low.endswith((".img.xz", ".xz")):
+            return ["bash", "-c", f'set -o pipefail; xz -dc -- "$1" | sudo dd of="$2" bs={BS} iflag=fullblock status=progress conv=fsync', "bash", str(self.image), self.device]
+        if low.endswith((".img.gz", ".gz")):
+            return ["bash", "-c", f'set -o pipefail; gzip -dc -- "$1" | sudo dd of="$2" bs={BS} iflag=fullblock status=progress conv=fsync', "bash", str(self.image), self.device]
+        if low.endswith((".img.zst", ".zst")):
+            return ["bash", "-c", f'set -o pipefail; zstd -dc -- "$1" | sudo dd of="$2" bs={BS} iflag=fullblock status=progress conv=fsync', "bash", str(self.image), self.device]
+        raise RuntimeError("Неподдерживаемый формат образа")
+
+    def _append_log(self, line):
+        line = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", line).strip()
+        if not line:
+            return
+        self.log_lines.append(line)
+        self.log_lines = self.log_lines[-12:]
+        with open(self.log_path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(line + "\n")
+
+    def _parse_status(self, raw):
+        for part in re.split(r"[\r\n]+", raw):
+            part = part.strip()
+            if not part:
+                continue
+            b = parse_bytes(part)
+            if b is not None:
+                self.written = b
+                if self.image_size:
+                    self.percent = min(100, int((b * 100) / self.image_size))
+            m = re.search(r",\s*([0-9.]+\s*[A-Za-z]+/s)\s*$", part)
+            if m:
+                self.speed = m.group(1)
+            self._append_log(part)
+
+    def _run(self):
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(self.log_path, "w", encoding="utf-8") as f:
+                f.write(f"DEVICE={self.device}\nIMAGE={self.image}\nSTART={time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+            self.status = "ЗАПИСЬ"
+            cmd = self._build_command()
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            buf = ""
+            while True:
+                ch = self.process.stderr.read(1)
+                if ch == "":
+                    break
+                buf += ch
+                if ch in "\r\n":
+                    self._parse_status(buf)
+                    buf = ""
+                elif len(buf) > 4096:
+                    self._parse_status(buf)
+                    buf = ""
+                if self._stop:
+                    break
+
+            if buf:
+                self._parse_status(buf)
+
+            rc = self.process.wait()
+            self.final_rc = rc
+            if self._stop:
+                self.status = "ОСТАНОВЛЕНО"
+                self._append_log("■ Запись остановлена пользователем")
+            elif rc == 0:
+                self.status = "СИНХРОНИЗАЦИЯ"
+                self._append_log("→ Выполняется sync…")
+                sync_rc = subprocess.run(["sudo", "sync"], check=False).returncode
+                if sync_rc != 0:
+                    raise RuntimeError("sync завершился с ошибкой")
+                self.status = "ГОТОВО"
+                if self.image_size:
+                    self.written = self.image_size
+                    self.percent = 100
+                self._append_log("✓ Запись и синхронизация завершены")
+            else:
+                self.status = "ОШИБКА"
+                self._append_log(f"✗ dd завершился с кодом {rc}")
+        except Exception as e:
+            self.status = "ОШИБКА"
+            self._append_log(f"✗ {e}")
+        finally:
+            self.elapsed = time.monotonic() - self.start
+            self.app.ui_queue.put(("done", self))
+
+    def stop(self):
+        self._stop = True
+        try:
+            if self.process and self.process.poll() is None:
+                self.process.send_signal(signal.SIGTERM)
+        except Exception:
+            pass
+
+
+class ImagePicker(tk.Toplevel):
+    """Собственный файловый менеджер для выбора образа."""
+    def __init__(self, parent, initial_path=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.result = None
+        self.history = []
+        self.current_dir = HOME
+        self.path_var = tk.StringVar()
+        self.search_var = tk.StringVar()
+        self.filter_var = tk.BooleanVar(value=True)
+        self.hidden_var = tk.BooleanVar(value=False)
+        self.selection_var = tk.StringVar(value="Файл не выбран")
+        self.file_count_var = tk.StringVar(value="")
+
+        initial = Path(initial_path).expanduser() if initial_path else HOME
+        try:
+            if initial.is_file():
+                self.current_dir = initial.parent
+            elif initial.is_dir():
+                self.current_dir = initial
+        except Exception:
+            self.current_dir = HOME
+
+        self.title("Выбор образа · SD FLASHER")
+        self.geometry("1120x720")
+        self.minsize(900, 580)
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self._setup_picker_style()
+        self._build_picker_ui()
+        self.bind("<Escape>", lambda e: self.cancel())
+        self.bind("<Control-KeyPress-l>", lambda e: self.path_entry.focus_set())
+        self.bind("<Return>", lambda e: self.activate_selected())
+        self.after(60, self._center_on_parent)
+        self.refresh()
+
+    def _center_on_parent(self):
+        self.update_idletasks()
+        try:
+            px = self.parent.winfo_rootx()
+            py = self.parent.winfo_rooty()
+            pw = self.parent.winfo_width()
+            ph = self.parent.winfo_height()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            x = max(0, px + (pw - w) // 2)
+            y = max(0, py + (ph - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _setup_picker_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Picker.TButton", background=CARD_2, foreground=TEXT,
+                        borderwidth=0, padding=(11, 8), font=(FONT, 9, "bold"))
+        style.map("Picker.TButton", background=[("active", CARD_3), ("pressed", "#20314b")])
+        style.configure("Picker.Accent.TButton", background=ACCENT, foreground="#06202a",
+                        borderwidth=0, padding=(18, 9), font=(FONT, 9, "bold"))
+        style.map("Picker.Accent.TButton", background=[("active", "#67e8f9"), ("pressed", "#06b6d4")])
+        style.configure("Picker.TEntry", fieldbackground="#0b1524", foreground=TEXT,
+                        borderwidth=1, padding=8)
+        style.configure("Picker.Treeview", background="#0b1524", fieldbackground="#0b1524",
+                        foreground=TEXT_2, borderwidth=0, rowheight=34,
+                        font=(FONT, 9))
+        style.map("Picker.Treeview", background=[("selected", "#123e55")],
+                  foreground=[("selected", TEXT)])
+        style.configure("Picker.Treeview.Heading", background=CARD_2, foreground=MUTED,
+                        relief="flat", font=(FONT, 8, "bold"), padding=(8, 7))
+        style.map("Picker.Treeview.Heading", background=[("active", CARD_3)])
+
+    def _label(self, parent, text="", size=10, color=TEXT, bold=False, **kwargs):
+        return tk.Label(parent, text=text, bg=kwargs.pop("bg", parent.cget("bg")), fg=color,
+                        font=(FONT, size, "bold" if bold else "normal"), **kwargs)
+
+    def _build_picker_ui(self):
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True)
+
+        # Header
+        header = tk.Frame(outer, bg=BG_TOP, height=78)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        brand = tk.Frame(header, bg=BG_TOP)
+        brand.pack(side="left", padx=20, pady=12)
+        tk.Label(brand, text="IMG", bg="#103247", fg=ACCENT, width=5, height=2,
+                 font=(FONT, 11, "bold")).pack(side="left", padx=(0, 12))
+        title = tk.Frame(brand, bg=BG_TOP)
+        title.pack(side="left")
+        self._label(title, "ВЫБОР ОБРАЗА", 14, TEXT, True, bg=BG_TOP).pack(anchor="w")
+        self._label(title, "Выберите файл для параллельной записи", 8, MUTED, bg=BG_TOP).pack(anchor="w", pady=(2, 0))
+
+        # Navigation bar
+        nav = tk.Frame(outer, bg=BG, padx=14, pady=12)
+        nav.pack(fill="x")
+        self.back_btn = ttk.Button(nav, text="‹", width=3, style="Picker.TButton", command=self.go_back)
+        self.back_btn.pack(side="left")
+        ttk.Button(nav, text="↑  Вверх", style="Picker.TButton", command=self.go_up).pack(side="left", padx=6)
+        ttk.Button(nav, text="⌂  Домой", style="Picker.TButton", command=lambda: self.go_to(HOME, True)).pack(side="left")
+
+        self.path_entry = ttk.Entry(nav, textvariable=self.path_var, style="Picker.TEntry")
+        self.path_entry.pack(side="left", fill="x", expand=True, padx=10)
+        self.path_entry.bind("<Return>", lambda e: self.go_path_entry())
+        ttk.Button(nav, text="Перейти", style="Picker.TButton", command=self.go_path_entry).pack(side="left")
+        ttk.Button(nav, text="⟳", width=3, style="Picker.TButton", command=self.refresh).pack(side="left", padx=(6, 0))
+
+        # Main content
+        content = tk.Frame(outer, bg=BG, padx=14)
+        content.pack(fill="both", expand=True)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+
+        sidebar = tk.Frame(content, bg=CARD, highlightbackground=BORDER, highlightthickness=1, width=200)
+        sidebar.grid(row=0, column=0, sticky="nsew", padx=(0, 9))
+        sidebar.grid_propagate(False)
+        self._label(sidebar, "БЫСТРЫЙ ДОСТУП", 8, ACCENT, True, bg=CARD).pack(anchor="w", padx=14, pady=(15, 9))
+
+        places = [
+            ("⌂  Домашняя", HOME),
+            ("▣  Рабочий стол", HOME / "Рабочий стол"),
+            ("↓  Загрузки", HOME / "Загрузки"),
+            ("♪  Музыка", HOME / "Музыка"),
+            ("▤  Документы", HOME / "Документы"),
+            ("/  Файловая система", Path("/")),
+        ]
+        self.place_buttons = []
+        for label, path in places:
+            b = tk.Button(sidebar, text=label, anchor="w", relief="flat", bd=0,
+                          bg=CARD, fg=TEXT_2, activebackground=CARD_3, activeforeground=TEXT,
+                          font=(FONT, 9), padx=13, pady=8,
+                          command=lambda p=path: self.go_to(p, True))
+            b.pack(fill="x", padx=7, pady=1)
+            self.place_buttons.append((b, path))
+
+        ttk.Separator(sidebar, orient="horizontal").pack(fill="x", padx=12, pady=11)
+        self._label(sidebar, "ФИЛЬТР", 8, MUTED, True, bg=CARD).pack(anchor="w", padx=14, pady=(0, 7))
+        tk.Checkbutton(sidebar, text="Только образы", variable=self.filter_var, command=self.refresh,
+                       bg=CARD, fg=TEXT_2, activebackground=CARD, activeforeground=TEXT,
+                       selectcolor="#1b304b", bd=0, highlightthickness=0, anchor="w",
+                       font=(FONT, 8)).pack(fill="x", padx=10, pady=2)
+        tk.Checkbutton(sidebar, text="Показывать скрытые", variable=self.hidden_var, command=self.refresh,
+                       bg=CARD, fg=TEXT_2, activebackground=CARD, activeforeground=TEXT,
+                       selectcolor="#1b304b", bd=0, highlightthickness=0, anchor="w",
+                       font=(FONT, 8)).pack(fill="x", padx=10, pady=2)
+
+        main = tk.Frame(content, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        main.grid(row=0, column=1, sticky="nsew")
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(2, weight=1)
+
+        toolbar = tk.Frame(main, bg=CARD)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=14, pady=(13, 9))
+        search_wrap = tk.Frame(toolbar, bg="#0b1524", highlightbackground="#1f3550", highlightthickness=1)
+        search_wrap.pack(side="left", fill="x", expand=True)
+        tk.Label(search_wrap, text="⌕", bg="#0b1524", fg=MUTED, font=(FONT, 12)).pack(side="left", padx=(10, 4))
+        self.search_entry = ttk.Entry(search_wrap, textvariable=self.search_var, style="Picker.TEntry")
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 4), pady=2)
+        self.search_var.trace_add("write", lambda *_: self.refresh())
+        self._label(toolbar, "", 8, MUTED, bg=CARD, textvariable=self.file_count_var).pack(side="right", padx=(10, 0))
+
+        cols = ("name", "type", "size", "modified")
+        self.tree = ttk.Treeview(main, columns=cols, show="headings", style="Picker.Treeview", selectmode="browse")
+        headings = {"name": "ИМЯ", "type": "ТИП", "size": "РАЗМЕР", "modified": "ИЗМЕНЁН"}
+        widths = {"name": 450, "type": 110, "size": 110, "modified": 150}
+        for c in cols:
+            self.tree.heading(c, text=headings[c])
+            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "name"))
+        self.tree.grid(row=2, column=0, sticky="nsew", padx=(12, 0), pady=(0, 10))
+        tree_scroll = ttk.Scrollbar(main, orient="vertical", command=self.tree.yview)
+        tree_scroll.grid(row=2, column=1, sticky="ns", padx=(0, 12), pady=(0, 10))
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.tree.bind("<Double-1>", lambda e: self.activate_selected())
+        self.tree.bind("<Return>", lambda e: self.activate_selected())
+
+        selected = tk.Frame(main, bg="#0d1727", highlightbackground="#18304a", highlightthickness=1)
+        selected.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+        self._label(selected, "ВЫБРАННЫЙ ФАЙЛ", 7, MUTED, True, bg="#0d1727").pack(anchor="w", padx=12, pady=(9, 3))
+        self.selected_label = tk.Label(selected, textvariable=self.selection_var, bg="#0d1727", fg=TEXT,
+                                       font=(FONT, 9, "bold"), anchor="w")
+        self.selected_label.pack(fill="x", padx=12, pady=(0, 10))
+
+        # Footer
+        footer = tk.Frame(outer, bg=BG_TOP, height=70)
+        footer.pack(fill="x", pady=(12, 0))
+        footer.pack_propagate(False)
+        self._label(footer, "Enter — выбрать    ·    Ctrl+L — путь    ·    Esc — отмена", 8, MUTED, bg=BG_TOP).pack(side="left", padx=18, pady=22)
+        ttk.Button(footer, text="ОТМЕНА", style="Picker.TButton", command=self.cancel).pack(side="right", padx=(8, 18), pady=14)
+        self.open_btn = ttk.Button(footer, text="✓  ВЫБРАТЬ ОБРАЗ", style="Picker.Accent.TButton", command=self.activate_selected, state="disabled")
+        self.open_btn.pack(side="right", pady=14)
+
+    def _is_image(self, path):
+        try:
+            return path.name.lower().endswith(IMAGE_EXTENSIONS)
+        except Exception:
+            return False
+
+    def _format_type(self, path):
+        if path.is_dir():
+            return "Папка"
+        n = path.name.lower()
+        if n.endswith(".img"):
+            return "IMG"
+        if n.endswith(".img.xz") or n.endswith(".xz"):
+            return "XZ"
+        if n.endswith(".img.gz") or n.endswith(".gz"):
+            return "GZIP"
+        if n.endswith(".img.zst") or n.endswith(".zst"):
+            return "ZSTD"
+        try:
+            return path.suffix.upper().lstrip(".") or "Файл"
+        except Exception:
+            return "Файл"
+
+    def _format_size(self, path):
+        if path.is_dir():
+            return "—"
+        try:
+            return human_bytes(path.stat().st_size)
+        except Exception:
+            return "—"
+
+    def _format_time(self, path):
+        try:
+            return time.strftime("%d.%m.%Y %H:%M", time.localtime(path.stat().st_mtime))
+        except Exception:
+            return "—"
+
+    def refresh(self):
+        directory = self.current_dir
+        if not directory.exists() or not directory.is_dir():
+            directory = HOME
+            self.current_dir = directory
+        self.path_var.set(str(directory))
+        self.file_count_var.set("Загрузка…")
+        self.tree.delete(*self.tree.get_children())
+        query = self.search_var.get().strip().lower()
+        entries = []
+        try:
+            for p in directory.iterdir():
+                if not self.hidden_var.get() and p.name.startswith("."):
+                    continue
+                if query and query not in p.name.lower():
+                    continue
+                try:
+                    is_dir = p.is_dir()
+                except OSError:
+                    is_dir = False
+                if not is_dir and self.filter_var.get() and not self._is_image(p):
+                    continue
+                entries.append(p)
+        except PermissionError:
+            self.file_count_var.set("Нет доступа к папке")
+            return
+        except OSError as e:
+            self.file_count_var.set(str(e))
+            return
+
+        entries.sort(key=lambda p: (not p.is_dir(), p.name.lower()))
+        for p in entries:
+            iid = str(p)
+            prefix = "▸  " if p.is_dir() else "▰  "
+            self.tree.insert("", "end", iid=iid,
+                             values=(prefix + p.name, self._format_type(p), self._format_size(p), self._format_time(p)),
+                             tags=("dir" if p.is_dir() else "file",))
+        self.tree.tag_configure("dir", foreground=ACCENT_2)
+        self.tree.tag_configure("file", foreground=TEXT_2)
+        self.file_count_var.set(f"{len(entries)} объектов")
+        self._update_nav_buttons()
+
+    def _update_nav_buttons(self):
+        self.back_btn.config(state="normal" if self.history else "disabled")
+
+    def go_to(self, path, reset_history=False):
+        path = Path(path).expanduser()
+        try:
+            path = path.resolve()
+        except Exception:
+            pass
+        if not path.exists() or not path.is_dir():
+            return
+        if path == self.current_dir:
+            self.refresh()
+            return
+        if not reset_history:
+            self.history.append(self.current_dir)
+        else:
+            self.history.clear()
+        self.current_dir = path
+        self.search_var.set("")
+        self.refresh()
+
+    def go_back(self):
+        if not self.history:
+            return
+        self.current_dir = self.history.pop()
+        self.search_var.set("")
+        self.refresh()
+
+    def go_up(self):
+        if self.current_dir.parent != self.current_dir:
+            self.go_to(self.current_dir.parent)
+
+    def go_path_entry(self):
+        raw = self.path_var.get().strip()
+        if not raw:
+            return
+        self.go_to(raw)
+
+    def on_tree_select(self, _event=None):
+        item = self.tree.selection()
+        if not item:
+            self.selection_var.set("Файл не выбран")
+            self.open_btn.config(state="disabled")
+            return
+        path = Path(item[0])
+        if path.is_file() and self._is_image(path):
+            self.selection_var.set(f"{path.name}    ·    {self._format_size(path)}    ·    {path}")
+            self.open_btn.config(state="normal")
+        elif path.is_dir():
+            self.selection_var.set(f"Папка: {path.name}")
+            self.open_btn.config(state="disabled")
+        else:
+            self.selection_var.set("Выберите поддерживаемый образ")
+            self.open_btn.config(state="disabled")
+
+    def activate_selected(self):
+        item = self.tree.selection()
+        if not item:
+            return
+        path = Path(item[0])
+        if path.is_dir():
+            self.go_to(path)
+            return
+        if not path.is_file() or not self._is_image(path):
+            return
+        self.result = path.resolve()
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class SDFlasherGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME}  ·  {VERSION}")
+        self.geometry("1360x860")
+        self.minsize(1080, 700)
+        self.configure(bg=BG)
+        self.ui_queue = queue.Queue()
+        self.jobs = []
+        self.running = False
+        self.device_vars = {}
+        self.devices = {}
+        self.device_rows = {}
+        self.spinner_idx = 0
+        self.status_var = tk.StringVar(value="Система готова")
+        self.image_var = tk.StringVar()
+        self.image_info_var = tk.StringVar(value="Выберите образ для записи")
+        self.selected_count_var = tk.StringVar(value="0 выбрано")
+        self.device_summary_var = tk.StringVar(value="Поиск накопителей…")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._setup_style()
+        self._build_ui()
+
+        last = load_last_image()
+        if last and last.exists():
+            self.image_var.set(str(last))
+            self.update_image_info()
+
+        self.refresh_devices()
+        self.after(80, self.process_queue)
+        self.after(400, self.update_jobs)
+        self.after(150, self.update_selection_counter)
+        self.after(100, self.update_spinner)
+
+    def _setup_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("App.TFrame", background=BG)
+        style.configure("Card.TLabelframe", background=CARD, foreground=TEXT, bordercolor=BORDER, relief="flat", borderwidth=1)
+        style.configure("Card.TLabelframe.Label", background=CARD, foreground=TEXT_2, font=(FONT, 10, "bold"))
+        style.configure("Main.TButton", background=CARD_2, foreground=TEXT, borderwidth=0, padding=(14, 9), font=(FONT, 10, "bold"))
+        style.map("Main.TButton", background=[("active", CARD_3), ("pressed", "#20314b")])
+        style.configure("Accent.TButton", background=ACCENT, foreground="#06202a", borderwidth=0, padding=(18, 11), font=(FONT, 10, "bold"))
+        style.map("Accent.TButton", background=[("active", "#67e8f9"), ("pressed", "#06b6d4")])
+        style.configure("Danger.TButton", background="#3a1d29", foreground="#fecdd3", borderwidth=0, padding=(14, 9), font=(FONT, 10, "bold"))
+        style.map("Danger.TButton", background=[("active", "#542435")])
+        style.configure("TEntry", fieldbackground="#0c1626", foreground=TEXT, borderwidth=1, padding=9)
+        style.configure("Horizontal.TProgressbar", troughcolor="#0b1524", background=ACCENT, bordercolor="#0b1524", lightcolor=ACCENT, darkcolor=ACCENT, thickness=10)
+        style.configure("TScrollbar", troughcolor=BG, background=CARD_2, bordercolor=BG, arrowcolor=MUTED)
+
+    def _label(self, parent, text="", size=10, color=TEXT, bold=False, **kwargs):
+        return tk.Label(parent, text=text, bg=kwargs.pop("bg", parent.cget("bg")), fg=color,
+                        font=(FONT, size, "bold" if bold else "normal"), **kwargs)
+
+    def _build_ui(self):
+        root = tk.Frame(self, bg=BG)
+        root.pack(fill="both", expand=True)
+
+        # ── HEADER ─────────────────────────────────────────────────────
+        header = tk.Frame(root, bg=BG_TOP, height=76)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        brand = tk.Frame(header, bg=BG_TOP)
+        brand.pack(side="left", padx=22)
+        logo = tk.Label(brand, text="SD", bg=ACCENT, fg="#06202a", width=4, height=2,
+                        font=(FONT, 13, "bold"))
+        logo.pack(side="left", padx=(0, 12), pady=12)
+        title_box = tk.Frame(brand, bg=BG_TOP)
+        title_box.pack(side="left", pady=11)
+        self._label(title_box, APP_NAME, 17, TEXT, True, bg=BG_TOP).pack(anchor="w")
+        self._label(title_box, "Параллельная прошивка SD-карт и USB-накопителей", 9, MUTED, bg=BG_TOP).pack(anchor="w", pady=(1, 0))
+
+        header_mid = tk.Frame(header, bg=BG_TOP)
+        header_mid.pack(side="right", padx=18)
+        self.header_state = tk.Label(header_mid, text="●  ГОТОВ", bg="#10352d", fg=GREEN,
+                                     font=(FONT, 9, "bold"), padx=12, pady=6)
+        self.header_state.pack(side="right", padx=(10, 0))
+        self._label(header_mid, "", 9, TEXT_2, True, bg=BG_TOP, textvariable=self.selected_count_var).pack(side="right")
+        self._label(header_mid, VERSION, 8, MUTED, bg=BG_TOP).pack(side="right", padx=(14, 0))
+
+        # ── MAIN ───────────────────────────────────────────────────────
+        body = tk.Frame(root, bg=BG, padx=16, pady=14)
+        body.pack(fill="both", expand=True)
+
+        body.grid_columnconfigure(0, minsize=400, weight=0)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        # LEFT SIDEBAR
+        left = tk.Frame(body, bg=BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left.grid_rowconfigure(1, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+
+        # ── Firmware / Image selector ─────────────────────────────────
+        image_card = tk.Frame(left, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        image_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        image_head = tk.Frame(image_card, bg=CARD)
+        image_head.pack(fill="x", padx=16, pady=(15, 8))
+        self._label(image_head, "1  ·  ОБРАЗ ДЛЯ ЗАПИСИ", 10, ACCENT, True, bg=CARD).pack(side="left")
+        self.image_format_badge = tk.Label(
+            image_head, text="IMG / XZ / GZ / ZST", bg="#0d2a38", fg=ACCENT,
+            font=(FONT, 8, "bold"), padx=9, pady=4
+        )
+        self.image_format_badge.pack(side="right")
+
+        # Большая зона выбора образа
+        selector = tk.Frame(
+            image_card, bg="#0c1626", highlightbackground="#1f3550",
+            highlightthickness=1
+        )
+        selector.pack(fill="x", padx=14, pady=(0, 10))
+
+        selector_left = tk.Frame(selector, bg="#0c1626")
+        selector_left.pack(side="left", fill="both", expand=True, padx=14, pady=13)
+
+        self.image_icon_label = tk.Label(
+            selector_left, text="IMG", bg="#103247", fg=ACCENT,
+            font=(FONT, 13, "bold"), padx=12, pady=8
+        )
+        self.image_icon_label.pack(side="left", padx=(0, 12))
+
+        selector_text = tk.Frame(selector_left, bg="#0c1626")
+        selector_text.pack(side="left", fill="x", expand=True)
+
+        self.image_name_label = tk.Label(
+            selector_text, text="Образ не выбран", bg="#0c1626", fg=MUTED,
+            font=(FONT, 11, "bold"), anchor="w"
+        )
+        self.image_name_label.pack(fill="x")
+
+        self.image_info_label = tk.Label(
+            selector_text, textvariable=self.image_info_var, bg="#0c1626", fg=MUTED,
+            font=(FONT, 8), anchor="w", justify="left"
+        )
+        self.image_info_label.pack(fill="x", pady=(4, 0))
+
+        ttk.Button(
+            selector, text="ВЫБРАТЬ ОБРАЗ", style="Accent.TButton",
+            command=self.choose_image
+        ).pack(side="right", padx=13, pady=13)
+
+        # Последний образ / ручной путь
+        path_title = tk.Frame(image_card, bg=CARD)
+        path_title.pack(fill="x", padx=16, pady=(0, 5))
+        self._label(path_title, "Путь к образу", 8, TEXT_2, True, bg=CARD).pack(side="left")
+        self._label(path_title, "сохраняется между запусками", 8, MUTED, bg=CARD).pack(side="right")
+
+        image_path_row = tk.Frame(image_card, bg=CARD)
+        image_path_row.pack(fill="x", padx=14, pady=(0, 8))
+        self.image_entry = ttk.Entry(image_path_row, textvariable=self.image_var)
+        self.image_entry.pack(side="left", fill="x", expand=True)
+        self.image_entry.bind("<FocusOut>", lambda e: self.update_image_info())
+
+        ttk.Button(
+            image_path_row, text="Последний", style="Main.TButton",
+            command=self.use_last
+        ).pack(side="left", padx=(7, 0))
+        ttk.Button(
+            image_path_row, text="Очистить", style="Main.TButton",
+            command=self.clear_image
+        ).pack(side="left", padx=(7, 0))
+
+        self.image_hint = tk.Label(
+            image_card,
+            text="Выберите файл образа кнопкой выше или вставьте путь вручную.",
+            bg=CARD, fg=MUTED, font=(FONT, 8), anchor="w",
+        )
+        self.image_hint.pack(fill="x", padx=16, pady=(0, 13))
+
+        # Device card
+        devices_card = tk.Frame(left, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        devices_card.grid(row=1, column=0, sticky="nsew")
+
+        dev_head = tk.Frame(devices_card, bg=CARD)
+        dev_head.pack(fill="x", padx=14, pady=(13, 8))
+        self._label(dev_head, "2  ·  НАКОПИТЕЛИ", 9, ACCENT_2, True, bg=CARD).pack(side="left")
+        self._label(dev_head, "", 8, MUTED, bg=CARD, textvariable=self.device_summary_var).pack(side="left", padx=10)
+
+        tools = tk.Frame(devices_card, bg=CARD)
+        tools.pack(fill="x", padx=14, pady=(0, 8))
+        ttk.Button(tools, text="Выбрать все", style="Main.TButton", command=self.select_all).pack(side="left")
+        ttk.Button(tools, text="Снять", style="Main.TButton", command=self.clear_all).pack(side="left", padx=6)
+        ttk.Button(tools, text="⟳", width=3, style="Main.TButton", command=self.refresh_devices).pack(side="right")
+
+        self.device_canvas = tk.Canvas(devices_card, bg=CARD, highlightthickness=0)
+        self.device_scroll = ttk.Scrollbar(devices_card, orient="vertical", command=self.device_canvas.yview)
+        self.device_inner = tk.Frame(self.device_canvas, bg=CARD)
+        self.device_canvas.configure(yscrollcommand=self.device_scroll.set)
+        self.device_canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
+        self.device_scroll.pack(side="right", fill="y", padx=(0, 10), pady=(0, 10))
+        self.device_window = self.device_canvas.create_window((0, 0), window=self.device_inner, anchor="nw")
+        self.device_inner.bind("<Configure>", lambda e: self.device_canvas.configure(scrollregion=self.device_canvas.bbox("all")))
+        self.device_canvas.bind("<Configure>", lambda e: self.device_canvas.itemconfig(self.device_window, width=e.width))
+        self.device_canvas.bind("<Enter>", lambda e: self._set_scroll_canvas(self.device_canvas))
+        self.device_canvas.bind("<Leave>", lambda e: self._set_scroll_canvas(None))
+        self._active_scroll_canvas = None
+
+        # RIGHT MAIN — monitoring
+        right = tk.Frame(body, bg=BG)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        monitor_head = tk.Frame(right, bg=BG)
+        monitor_head.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self._label(monitor_head, "3  ·  ПРОЦЕСС ЗАПИСИ", 10, TEXT, True, bg=BG).pack(side="left")
+        self._label(monitor_head, "", 8, MUTED, bg=BG, textvariable=self.status_var).pack(side="right")
+
+        # Scrollable job dashboard
+        monitor_card = tk.Frame(right, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        monitor_card.grid(row=1, column=0, sticky="nsew")
+
+        self.logs_canvas = tk.Canvas(monitor_card, bg=CARD, highlightthickness=0)
+        self.logs_scroll = ttk.Scrollbar(monitor_card, orient="vertical", command=self.logs_canvas.yview)
+        self.logs_inner = tk.Frame(self.logs_canvas, bg=CARD)
+        self.logs_canvas.configure(yscrollcommand=self.logs_scroll.set)
+        self.logs_canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+        self.logs_scroll.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        self.logs_window = self.logs_canvas.create_window((0, 0), window=self.logs_inner, anchor="nw")
+        self.logs_inner.bind("<Configure>", lambda e: self.logs_canvas.configure(scrollregion=self.logs_canvas.bbox("all")))
+        self.logs_canvas.bind("<Configure>", lambda e: self.logs_canvas.itemconfig(self.logs_window, width=e.width))
+        self.logs_canvas.bind("<Enter>", lambda e: self._set_scroll_canvas(self.logs_canvas))
+        self.logs_canvas.bind("<Leave>", lambda e: self._set_scroll_canvas(None))
+
+        self.empty_monitor = tk.Frame(self.logs_inner, bg=CARD)
+        self.empty_monitor.pack(fill="both", expand=True, padx=30, pady=70)
+        tk.Label(self.empty_monitor, text="◉", bg=CARD, fg="#24415e", font=(FONT, 34, "bold")).pack()
+        self._label(self.empty_monitor, "Готово к прошивке", 14, TEXT_2, True, bg=CARD).pack(pady=(8, 3))
+        self._label(self.empty_monitor, "Выберите образ и одну или несколько SD-карт слева.\n\nПосле запуска здесь появится live-мониторинг каждой записи.", 9, MUTED, bg=CARD, justify="center").pack()
+
+        # BOTTOM ACTION BAR
+        footer = tk.Frame(root, bg=BG_TOP, height=72)
+        footer.pack(fill="x")
+        footer.pack_propagate(False)
+
+        footer_left = tk.Frame(footer, bg=BG_TOP)
+        footer_left.pack(side="left", padx=18, pady=12)
+        self.start_button = ttk.Button(footer_left, text="▶  НАЧАТЬ ПАРАЛЛЕЛЬНУЮ ЗАПИСЬ", style="Accent.TButton", command=self.start_flash)
+        self.start_button.pack(side="left")
+        self.stop_button = ttk.Button(footer_left, text="■  Остановить", style="Danger.TButton", command=self.stop_all, state="disabled")
+        self.stop_button.pack(side="left", padx=8)
+
+        footer_right = tk.Frame(footer, bg=BG_TOP)
+        footer_right.pack(side="right", padx=18, pady=12)
+        self._label(footer_right, "Системный диск защищён автоматически", 8, MUTED, bg=BG_TOP).pack(anchor="e")
+        self._label(footer_right, "Параллельная запись  ·  Live Log  ·  sync после записи", 8, TEXT_2, bg=BG_TOP).pack(anchor="e", pady=(2, 0))
+
+    def _set_scroll_canvas(self, canvas):
+        self._active_scroll_canvas = canvas
+        if canvas is not None and not getattr(self, "_wheel_bound", False):
+            self.bind_all("<MouseWheel>", self._mousewheel_active)
+            self._wheel_bound = True
+
+    def _mousewheel_active(self, event):
+        canvas = getattr(self, "_active_scroll_canvas", None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        delta = event.delta
+        if delta == 0:
+            return
+        canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+    def choose_image(self):
+        picker = ImagePicker(self, self.image_var.get().strip() or load_last_image())
+        self.wait_window(picker)
+        if picker.result:
+            self.image_var.set(str(picker.result))
+            save_last_image(picker.result)
+            self.update_image_info()
+
+    def clear_image(self):
+        self.image_var.set("")
+        self.update_image_info()
+
+    def use_last(self):
+        last = load_last_image()
+        if not last:
+            messagebox.showinfo(APP_NAME, "Сохранённый путь не найден.")
+            return
+        if not last.exists():
+            messagebox.showwarning(APP_NAME, f"Последний образ больше не найден:\n{last}")
+            return
+        self.image_var.set(str(last))
+        self.update_image_info()
+
+    def update_image_info(self):
+        p = Path(self.image_var.get()).expanduser()
+        if p.is_file():
+            save_last_image(p.resolve())
+            low = p.name.lower()
+            suffix = "сжатый образ" if low.endswith((".xz", ".gz", ".zst")) else "образ IMG"
+            size_text = "размер неизвестен" if suffix == "сжатый образ" else human_bytes(p.stat().st_size)
+            info = f"✓  {size_text}   ·   {suffix}"
+            self.image_info_var.set(info)
+            if hasattr(self, "image_name_label"):
+                self.image_name_label.config(text=p.name, fg=TEXT)
+            if hasattr(self, "image_icon_label"):
+                self.image_icon_label.config(text=("IMG" if low.endswith(".img") else "ZIP"), fg=ACCENT)
+            if hasattr(self, "image_hint"):
+                self.image_hint.config(text=str(p))
+        elif self.image_var.get().strip():
+            self.image_info_var.set("⚠  Файл не найден")
+            if hasattr(self, "image_name_label"):
+                self.image_name_label.config(text="Образ не найден", fg=RED)
+            if hasattr(self, "image_icon_label"):
+                self.image_icon_label.config(text="!", fg=RED)
+            if hasattr(self, "image_hint"):
+                self.image_hint.config(text="Проверьте путь или выберите другой образ.", fg=RED)
+        else:
+            self.image_info_var.set("Выберите образ для записи")
+            if hasattr(self, "image_name_label"):
+                self.image_name_label.config(text="Образ не выбран", fg=MUTED)
+            if hasattr(self, "image_icon_label"):
+                self.image_icon_label.config(text="IMG", fg=MUTED)
+            if hasattr(self, "image_hint"):
+                self.image_hint.config(text="Выберите файл образа кнопкой выше или вставьте путь вручную.", fg=MUTED)
+
+    def _set_check(self, path, value):
+        if path in self.device_vars:
+            self.device_vars[path].set(value)
+        self.update_selection_counter()
+
+    def select_all(self):
+        for v in self.device_vars.values():
+            v.set(True)
+        self.update_selection_counter()
+
+    def clear_all(self):
+        for v in self.device_vars.values():
+            v.set(False)
+        self.update_selection_counter()
+
+    def update_selection_counter(self):
+        count = sum(1 for v in self.device_vars.values() if v.get())
+        total = len(self.device_vars)
+        self.selected_count_var.set(f"Выбрано: {count} из {total}")
+        if not self.running:
+            self.start_button.config(state="normal" if count and self.image_var.get().strip() else "normal")
+        self.after(250, self.update_selection_counter)
+
+    def refresh_devices(self):
+        try:
+            disks = get_disks()
+        except Exception as e:
+            messagebox.showerror(APP_NAME, str(e))
+            return
+
+        old = {p: v.get() for p, v in self.device_vars.items()}
+        for w in self.device_inner.winfo_children():
+            w.destroy()
+        self.device_vars.clear()
+        self.devices = {d["path"]: d for d in disks}
+        self.device_rows.clear()
+
+        for idx, d in enumerate(disks):
+            self._create_device_row(d, old.get(d["path"], False), idx)
+
+        system = root_disk() or "не определён"
+        summary = f"Найдено: {len(disks)}    ·    Системный диск: {system}"
+        self.device_summary_var.set(summary)
+        self.update_selection_counter()
+
+        if not disks:
+            box = tk.Frame(self.device_inner, bg="#0d1727", padx=15, pady=18)
+            box.pack(fill="x", pady=6)
+            self._label(box, "SD / USB накопители не найдены", 11, YELLOW, True, bg="#0d1727").pack(anchor="w")
+            self._label(box, "Подключите карту через кардридер и нажмите «Обновить». Системный диск защищён.", 9, MUTED, bg="#0d1727").pack(anchor="w", pady=(4, 0))
+
+    def _create_device_row(self, d, selected=False, idx=0):
+        bg = "#132238" if idx % 2 == 0 else "#101d30"
+        border = "#29415f" if selected else BORDER
+        row = tk.Frame(self.device_inner, bg=bg, padx=10, pady=10, highlightbackground=border, highlightthickness=1)
+        row.pack(fill="x", pady=3)
+        var = tk.BooleanVar(value=selected)
+        self.device_vars[d["path"]] = var
+        self.device_rows[d["path"]] = row
+
+        top = tk.Frame(row, bg=bg)
+        top.pack(fill="x")
+        cb = tk.Checkbutton(top, variable=var, command=lambda p=d["path"]: self._device_changed(p),
+                            bg=bg, activebackground=bg, selectcolor="#203b5c", bd=0,
+                            highlightthickness=0, width=2)
+        cb.pack(side="left", padx=(0, 5))
+        self._label(top, d["path"], 11, TEXT, True, bg=bg).pack(side="left")
+        self._label(top, d["size"], 9, ACCENT, True, bg=bg).pack(side="left", padx=10)
+
+        state_color = YELLOW if d["state"] == "СМОНТИРОВАН" else GREEN if d["state"] == "ГОТОВ" else RED
+        state_bg = "#3b2f11" if d["state"] == "СМОНТИРОВАН" else "#10352d" if d["state"] == "ГОТОВ" else "#3d1d2a"
+        tk.Label(top, text=d["state"], bg=state_bg, fg=state_color, font=(FONT, 7, "bold"), padx=8, pady=3).pack(side="right")
+
+        model = d["model"]
+        if d["mounts"]:
+            model += f"  ·  {len(d['mounts'])} смонт."
+        sub = tk.Frame(row, bg=bg)
+        sub.pack(fill="x", pady=(4, 0), padx=(35, 0))
+        self._label(sub, model[:70], 8, TEXT_2, bg=bg, anchor="w").pack(side="left", fill="x", expand=True)
+        transport = d["tran"].upper() if d["tran"] else "USB"
+        self._label(sub, f"{transport}  ·  {d['serial']}", 7, MUTED, bg=bg).pack(side="right")
+
+    def _device_changed(self, path):
+        row = self.device_rows.get(path)
+        if row and path in self.device_vars:
+            bg = "#132238" if list(self.device_rows).index(path) % 2 == 0 else "#101d30"
+            border = "#29415f" if self.device_vars[path].get() else BORDER
+            row.configure(highlightbackground=border)
+        self.update_selection_counter()
+
+    def selected_devices(self):
+        return [p for p, v in self.device_vars.items() if v.get()]
+
+    def clear_logs(self):
+        for w in self.logs_inner.winfo_children():
+            w.destroy()
+
+    def create_job_card(self, job):
+        if hasattr(self, "empty_monitor") and self.empty_monitor.winfo_exists():
+            self.empty_monitor.destroy()
+
+        count = len(self.jobs) if self.jobs else 1
+        col = (count - 1) % 2
+        row_no = (count - 1) // 2
+        self.logs_inner.grid_columnconfigure(0, weight=1, uniform="jobs")
+        self.logs_inner.grid_columnconfigure(1, weight=1, uniform="jobs")
+
+        frame = tk.Frame(self.logs_inner, bg="#0d1727", padx=13, pady=12,
+                         highlightbackground=BORDER, highlightthickness=1)
+        frame.grid(row=row_no, column=col, sticky="nsew", padx=5, pady=5)
+
+        top = tk.Frame(frame, bg="#0d1727")
+        top.pack(fill="x")
+        icon = tk.Label(top, text="●", bg="#0d1727", fg=YELLOW, font=(FONT, 10, "bold"))
+        icon.pack(side="left", padx=(0, 7))
+        self._label(top, job.device, 11, TEXT, True, bg="#0d1727").pack(side="left")
+        meta = tk.Label(top, text="", bg="#0d1727", fg=MUTED, font=(FONT, 7))
+        meta.pack(side="left", padx=9)
+        status = tk.Label(top, text="ПОДГОТОВКА", bg="#3b2f11", fg=YELLOW,
+                          font=(FONT, 7, "bold"), padx=8, pady=4)
+        status.pack(side="right")
+
+        progress_line = tk.Frame(frame, bg="#0d1727")
+        progress_line.pack(fill="x", pady=(12, 5))
+        pb = ttk.Progressbar(progress_line, mode="indeterminate", maximum=100)
+        pb.pack(side="left", fill="x", expand=True, padx=(0, 9))
+        percent = tk.Label(progress_line, text="—", bg="#0d1727", fg=TEXT,
+                           font=(FONT, 10, "bold"), width=6, anchor="e")
+        percent.pack(side="right")
+
+        stats = tk.Label(frame, text="", bg="#0d1727", fg=TEXT_2, font=(FONT, 8), anchor="w")
+        stats.pack(fill="x", pady=(0, 5))
+
+        log_title = tk.Frame(frame, bg="#0d1727")
+        log_title.pack(fill="x", pady=(5, 4))
+        self._label(log_title, "● LIVE LOG", 7, GREEN, True, bg="#0d1727").pack(side="left")
+        self._label(log_title, "последние сообщения", 7, MUTED, bg="#0d1727").pack(side="right")
+
+        log = tk.Text(frame, height=8, bg=LOG_BG, fg=LOG_TEXT, insertbackground=TEXT,
+                      relief="flat", borderwidth=0, highlightthickness=1,
+                      highlightbackground="#18304a", font=(MONO, 8), wrap="word", padx=8, pady=7)
+        log.pack(fill="x")
+        log.configure(state="disabled")
+
+        footer = tk.Frame(frame, bg="#0d1727")
+        footer.pack(fill="x", pady=(7, 0))
+        log_path = tk.Label(footer, text=f"{job.log_path}", bg="#0d1727", fg="#50647d",
+                            font=(FONT, 7), anchor="w")
+        log_path.pack(side="left", fill="x", expand=True)
+
+        job.widgets = {
+            "frame": frame, "icon": icon, "status": status, "meta": meta,
+            "pb": pb, "percent": percent, "stats": stats, "log": log,
+        }
+
+    def update_job_widget(self, job):
+        w = job.widgets
+        elapsed = max(job.elapsed, time.monotonic() - job.start)
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
+        pct = f"{job.percent}%" if job.percent is not None else "—"
+        written = human_bytes(job.written)
+        w["percent"].config(text=pct)
+        w["stats"].config(text=f"Записано  {written}     ·     Скорость  {job.speed}     ·     Время  {mins:02d}:{secs:02d}")
+
+        palette = {
+            "ПОДГОТОВКА": (YELLOW, "#3b2f11"),
+            "ЗАПИСЬ": (ACCENT, "#0b3440"),
+            "СИНХРОНИЗАЦИЯ": (ACCENT_2, "#16365b"),
+            "ГОТОВО": (GREEN, "#10352d"),
+            "ОШИБКА": (RED, "#3d1d2a"),
+            "ОСТАНОВЛЕНО": (ORANGE, "#3c2818"),
+        }
+        fg, bg = palette.get(job.status, (TEXT_2, CARD_2))
+        w["status"].config(text=job.status, fg=fg, bg=bg)
+        w["icon"].config(fg=GREEN if job.status == "ГОТОВО" else RED if job.status == "ОШИБКА" else ACCENT if job.status == "ЗАПИСЬ" else YELLOW)
+
+        if job.percent is None and job.status not in {"ГОТОВО", "ОШИБКА", "ОСТАНОВЛЕНО"}:
+            if str(w["pb"]["mode"]) != "indeterminate":
+                w["pb"]["mode"] = "indeterminate"
+                w["pb"].start(10)
+        else:
+            try:
+                w["pb"].stop()
+            except Exception:
+                pass
+            w["pb"]["mode"] = "determinate"
+            w["pb"]["value"] = job.percent or 0
+
+        text = "\n".join(job.log_lines[-9:])
+        w["log"].configure(state="normal")
+        w["log"].delete("1.0", "end")
+        w["log"].insert("end", text)
+        w["log"].see("end")
+        w["log"].configure(state="disabled")
+
+    def update_spinner(self):
+        if self.running:
+            self.spinner_idx = (self.spinner_idx + 1) % len(SPINNER)
+            self.header_state.config(text=f"{SPINNER[self.spinner_idx]}  ЗАПИСЬ В ПРОЦЕССЕ", fg=ACCENT)
+        else:
+            self.header_state.config(text="●  ГОТОВ", fg=GREEN)
+        self.after(120, self.update_spinner)
+
+    def start_flash(self):
+        if self.running:
+            return
+        image = Path(self.image_var.get()).expanduser()
+        if not image.is_file():
+            messagebox.showerror(APP_NAME, "Выберите существующий файл образа.")
+            return
+        if not image.name.lower().endswith(IMAGE_EXTENSIONS):
+            messagebox.showerror(APP_NAME, "Неподдерживаемый формат образа.")
+            return
+
+        selected = self.selected_devices()
+        if not selected:
+            messagebox.showwarning(APP_NAME, "Выберите хотя бы один накопитель.")
+            return
+
+        try:
+            disks = {d["path"]: d for d in get_disks()}
+        except Exception as e:
+            messagebox.showerror(APP_NAME, str(e))
+            return
+
+        missing = [d for d in selected if d not in disks]
+        if missing:
+            messagebox.showerror(APP_NAME, "Эти устройства больше не обнаружены:\n" + "\n".join(missing))
+            self.refresh_devices()
+            return
+
+        system = root_disk()
+        unsafe = [d for d in selected if d == system or disks[d]["ro"]]
+        if unsafe:
+            messagebox.showerror(APP_NAME, "Нельзя записывать на:\n" + "\n".join(unsafe))
+            return
+
+        image_size = None
+        if not image.name.lower().endswith((".xz", ".gz", ".zst")):
+            image_size = image.stat().st_size
+            too_small = []
+            for d in selected:
+                rc, out, _ = run_cmd(["blockdev", "--getsize64", d])
+                if rc == 0 and out.strip().isdigit() and int(out.strip()) < image_size:
+                    too_small.append(d)
+            if too_small:
+                messagebox.showerror(APP_NAME, "Образ больше следующих накопителей:\n\n" + "\n".join(too_small))
+                return
+
+        save_last_image(image.resolve())
+        details = "\n".join(f"• {d}    {disks[d]['size']}    {disks[d]['model']}" for d in selected)
+        message = (
+            f"ОБРАЗ\n{image}\n\n"
+            f"ЦЕЛИ: {len(selected)}\n{details}\n\n"
+            "ВСЕ ДАННЫЕ НА ВЫБРАННЫХ НАКОПИТЕЛЯХ БУДУТ УДАЛЕНЫ.\n\n"
+            "Начать параллельную запись?"
+        )
+        if not messagebox.askyesno(APP_NAME, message, icon="warning"):
+            return
+
+        self.running = True
+        self.start_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.status_var.set("Подготовка накопителей…")
+        self.clear_logs()
+        self.jobs = []
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+
+        for d in selected:
+            try:
+                messages = unmount_disk(d)
+                for line in messages:
+                    self.status_var.set(f"{d}: {line}")
+                    self.update_idletasks()
+            except Exception as e:
+                self.running = False
+                self.start_button.config(state="normal")
+                self.stop_button.config(state="disabled")
+                messagebox.showerror(APP_NAME, f"Не удалось подготовить {d}:\n{e}")
+                return
+
+        for idx, d in enumerate(selected, 1):
+            safe = Path(d).name.replace("/", "_")
+            log_path = LOG_DIR / f"{safe}_{stamp}_{os.getpid()}_{idx}.log"
+            job = FlashJob(self, d, image.resolve(), log_path, image_size)
+            self.jobs.append(job)
+            self.create_job_card(job)
+
+        for job in self.jobs:
+            job.start_job()
+
+        self.status_var.set(f"Запись запущена на {len(self.jobs)} накопителях")
+
+    def stop_all(self):
+        if not self.running:
+            return
+        if not messagebox.askyesno(APP_NAME, "Остановить активные записи? Частично записанные карты могут стать нечитаемыми.", icon="warning"):
+            return
+        for job in self.jobs:
+            job.stop()
+        self.status_var.set("Остановка записей…")
+
+    def update_jobs(self):
+        if self.jobs:
+            for job in self.jobs:
+                self.update_job_widget(job)
+
+            if self.running and all(job.status in {"ГОТОВО", "ОШИБКА", "ОСТАНОВЛЕНО"} for job in self.jobs):
+                self.running = False
+                self.start_button.config(state="normal")
+                self.stop_button.config(state="disabled")
+                ok = sum(job.status == "ГОТОВО" for job in self.jobs)
+                fail = len(self.jobs) - ok
+                if fail == 0:
+                    self.status_var.set(f"✓ Все операции завершены · успешно: {ok}")
+                else:
+                    self.status_var.set(f"Завершено · успешно: {ok} · ошибок: {fail}")
+        self.after(400, self.update_jobs)
+
+    def process_queue(self):
+        try:
+            while True:
+                _, job = self.ui_queue.get_nowait()
+                self.update_job_widget(job)
+        except queue.Empty:
+            pass
+        self.after(100, self.process_queue)
+
+    def on_close(self):
+        if self.running:
+            if not messagebox.askyesno(APP_NAME, "Запись ещё выполняется. Закрыть окно и остановить её?", icon="warning"):
+                return
+            for job in self.jobs:
+                job.stop()
+            self.after(700, self.destroy)
+            return
+        self.destroy()
+
+
+def main():
+    required = ["lsblk", "findmnt", "udevadm", "sudo", "dd", "umount", "sync", "blockdev"]
+    missing = [x for x in required if shutil.which(x) is None]
+    if missing:
+        raise SystemExit("Не найдены команды: " + ", ".join(missing))
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    app = SDFlasherGUI()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+PY_GUI
