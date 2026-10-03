@@ -274,5 +274,4 @@ SD FLASHER 2.0 GUI
 
 ## Автор / проект
 
-**SD FLASHER**
 KrenDge
